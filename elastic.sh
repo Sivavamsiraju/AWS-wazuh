@@ -40,75 +40,109 @@ create_ssh_user(){
 }
 
 import_elk_repo(){
-# Configuring Elastic repository
-rpm --import https://packages.elastic.co/GPG-KEY-elasticsearch
+#Install dependencies
+yum install curl unzip wget libcap
 
-cat > /etc/yum.repos.d/elastic.repo << EOF
-[elasticsearch-${elastic_major_version}.x]
-name=Elasticsearch repository for ${elastic_major_version}.x packages
-baseurl=https://artifacts.elastic.co/packages/${elastic_major_version}.x/yum
+# Configuring Elastic repository
+rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
+
+#add wazuh repo to OS
+cat > /etc/yum.repos.d/wazuh.repo << EOF
+[wazuh]
 gpgcheck=1
-gpgkey=https://artifacts.elastic.co/GPG-KEY-elasticsearch
+gpgkey=https://packages.wazuh.com/key/GPG-KEY-WAZUH
 enabled=1
-autorefresh=1
-type=rpm-md
+name=EL-$releasever - Wazuh
+baseurl=https://packages.wazuh.com/4.x/yum/
+protect=1
 EOF
+
 echo "Added Elasticsearch repo." >> /tmp/deploy.log
 }
 
 install_elasticsearch(){
     echo "Installing Elasticsearch." >> /tmp/deploy.log
     # Installing Elasticsearch
-    yum -y install elasticsearch-${elastic_version}
+    yum install opendistroforelasticsearch -y
     chkconfig --add elasticsearch
     echo "Installed Elasticsearch." >> /tmp/deploy.log
 }
 
 configuring_elasticsearch(){
-# Creating data and logs directories
-mkdir -p /mnt/ephemeral/elasticsearch/lib
-mkdir -p /mnt/ephemeral/elasticsearch/log
-chown -R elasticsearch:elasticsearch /mnt/ephemeral/elasticsearch
-echo "Created volumes in ephemeral." >> /tmp/deploy.log
 
-cat > /etc/elasticsearch/elasticsearch.yml << EOF
-cluster.name: "wazuh_elastic"
-node.name: "node-$node_name"
-node.master: true
-path.data: /mnt/ephemeral/elasticsearch/lib
-path.logs: /mnt/ephemeral/elasticsearch/log
-discovery.seed_hosts:
-  - 192.168.1.189
+#Elasticsearch configuration
+curl -so /etc/elasticsearch/elasticsearch.yml https://packages.wazuh.com/resources/4.1/open-distro/elasticsearch/7.x/elasticsearch.yml
+echo "Elasticsearch configuration file downloaded." >> /tmp/deploy.log
 
-transport.host: 127.0.0.1
+#Elasticsearch roles and users
+curl -so /usr/share/elasticsearch/plugins/opendistro_security/securityconfig/roles.yml https://packages.wazuh.com/resources/4.1/open-distro/elasticsearch/roles/roles.yml
+curl -so /usr/share/elasticsearch/plugins/opendistro_security/securityconfig/roles_mapping.yml https://packages.wazuh.com/resources/4.1/open-distro/elasticsearch/roles/roles_mapping.yml
+curl -so /usr/share/elasticsearch/plugins/opendistro_security/securityconfig/internal_users.yml https://packages.wazuh.com/resources/4.1/open-distro/elasticsearch/roles/internal_users.yml
+echo "Elasticsearch users and roles files downloaded." >> /tmp/deploy.log
 
+#Certificates creation and deployment
+## remove default Certificates
+rm /etc/elasticsearch/esnode-key.pem /etc/elasticsearch/esnode.pem /etc/elasticsearch/kirk-key.pem /etc/elasticsearch/kirk.pem /etc/elasticsearch/root-ca.pem -f
+
+#Generate and deploy the certificates:
+#Download the wazuh-cert-tool.sh to create the certificates
+curl -so ~/wazuh-cert-tool.sh https://packages.wazuh.com/resources/4.1/open-distro/tools/certificate-utility/wazuh-cert-tool.sh
+curl -so ~/instances.yml https://packages.wazuh.com/resources/4.1/open-distro/tools/certificate-utility/instances.yml
+
+# Configuring instances data
+cat > ~/instances.yml << EOF
+# Elasticsearch nodes
+elasticsearch-nodes:
+  - name: node-1
+    ip:
+      - 192.168.1.163
+
+# Wazuh server nodes
+wazuh-servers:
+  - name: master-node
+    ip:
+      - 192.168.1.189
+  - name: worker-node
+    ip:
+      - 192.168.1.222
+
+# Kibana node
+kibana:
+  - name: node-2
+    ip:
+      - 192.168.1.163
 EOF
 
-echo "network.host: 0.0.0.0" >> /etc/elasticsearch/elasticsearch.yml
+#Run the wazuh-cert-tool.sh to create the certificates
+bash ~/wazuh-cert-tool.sh
 
-# Calculating RAM for Elasticsearch
-ram_gb=$[$(free -g | awk '/^Mem:/{print $2}')+1]
-ram=$(( ${ram_gb} / 2 ))
-if [ $ram -eq "0" ]; then ram=1; fi
-echo "Setting RAM." >> /tmp/deploy.log
+#Replace elasticsearch-node-name with your Elasticsearch node name, the same used in instances.yml to create the certificates, and move the certificates to their corresponding location:
+node_name=node-1
 
-# Configuring jvm.options
-cat > /etc/elasticsearch/jvm.options << EOF
--Xms${ram}g
--Xmx${ram}g
--Dlog4j2.disable.jmx=true
-EOF
-echo "Setting JVM options." >> /tmp/deploy.log
+mkdir /etc/elasticsearch/certs/
+mv ~/certs/$node_name* /etc/elasticsearch/certs/
+mv ~/certs/admin* /etc/elasticsearch/certs/
+cp ~/certs/root-ca* /etc/elasticsearch/certs/
+mv /etc/elasticsearch/certs/$node_name.pem /etc/elasticsearch/certs/elasticsearch.pem
+mv /etc/elasticsearch/certs/$node_name-key.pem /etc/elasticsearch/certs/elasticsearch-key.pem
 
-mkdir -p /etc/systemd/system/elasticsearch.service.d/
-echo '[Service]' > /etc/systemd/system/elasticsearch.service.d/elasticsearch.conf
-echo 'LimitMEMLOCK=infinity' >> /etc/systemd/system/elasticsearch.service.d/elasticsearch.conf
+# Compress all the necessary files to be sent to all the instances:
+cd ~/certs/
+tar -cvf certs.tar *=
+mv ~/certs/certs.tar ~/
 
-# Allowing unlimited memory allocation
-echo 'elasticsearch soft memlock unlimited' >> /etc/security/limits.conf
-echo 'elasticsearch hard memlock unlimited' >> /etc/security/limits.conf
-echo "Setting memory lock options." >> /tmp/deploy.log
-echo "Setting permissions." >> /tmp/deploy.log
+#Enable and start the Elasticsearch service:
+systemctl daemon-reload
+systemctl enable elasticsearch
+systemctl start elasticsearch
+
+#Run the Elasticsearch securityadmin script to load the new certificates information and start the cluster. To run this command, the value <elasticsearch_IP> must be replaced by the Elasticsearch installation IP
+export JAVA_HOME=/usr/share/elasticsearch/jdk/ && /usr/share/elasticsearch/plugins/opendistro_security/tools/securityadmin.sh -cd /usr/share/elasticsearch/plugins/opendistro_security/securityconfig/ -nhnv -cacert /etc/elasticsearch/certs/root-ca.pem -cert /etc/elasticsearch/certs/admin.pem -key /etc/elasticsearch/certs/admin-key.pem -h 192.168.1.163
+
+#allow port for elasticsearch from firewall
+firewall-cmd --zone=public --permanent --add-port 9200/tcp
+firewall-cmd --reload
+
 # restarting elasticsearch after changes
 start_elasticsearch
 }
@@ -141,6 +175,68 @@ disable_elk_repos(){
     sed -i "s/^enabled=1/enabled=0/" /etc/yum.repos.d/elastic.repo
 }
 
+install_kibana(){
+  #install Kibana
+  yum install opendistroforelasticsearch-kibana -y
+
+}
+
+configuring_kibana(){
+curl -so /etc/kibana/kibana.yml https://packages.wazuh.com/resources/4.1/open-distro/kibana/7.x/kibana.yml
+cat > /etc/kibana/kibana.yml << EOF
+server.host: 192.168.1.163
+elasticsearch.hosts: https://192.168.1.163:9200
+server.port: 443
+elasticsearch.ssl.verificationMode: certificate
+elasticsearch.username: kibanaserver
+elasticsearch.password: kibanaserver
+elasticsearch.requestHeadersWhitelist: ["securitytenant","Authorization"]
+opendistro_security.multitenancy.enabled: true
+opendistro_security.readonly_mode.roles: ["kibana_read_only"]
+server.ssl.enabled: true
+server.ssl.key: "/etc/kibana/certs/kibana-key.pem"
+server.ssl.certificate: "/etc/kibana/certs/kibana.pem"
+elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certs/root-ca.pem"]
+server.defaultRoute: /app/wazuh?security_tenant=global
+EOF
+
+# Create the /usr/share/kibana/data directory
+mkdir /usr/share/kibana/data
+chown -R kibana:kibana /usr/share/kibana/data
+
+#Install the Wazuh Kibana plugin:
+##The installation of the plugin must be done from the Kibana home directory:
+cd /usr/share/kibana
+sudo -u kibana bin/kibana-plugin install https://packages.wazuh.com/4.x/ui/kibana/wazuh_kibana-4.1.5_7.10.2-1.zip
+
+#Replace kibana-node-name with your Kibana node name, the same used in instances.yml to create the certificates, and move the certificates to their corresponding location. This guide assumes that a copy of certs.tar, created during the Elasticsearch installation, has been placed in the root home folder (~/).
+node_name=node-2
+
+mkdir /etc/kibana/certs
+
+mv ~/certs/$node_name* /etc/kibana/certs/
+mv ~/certs/admin* /etc/kibana/certs/
+cp ~/certs/root-ca* /etc/kibana/certs/
+mv /etc/kibana/certs/$node_name.pem /etc/kibana/certs/kibana.pem
+mv /etc/kibana/certs/$node_name-key.pem /etc/kibana/certs/kibana-key.pem
+
+chmod 755 /etc/kibana/certs/*
+
+
+
+#Link Kibana’s socket to privileged port 443:
+setcap 'cap_net_bind_service=+ep' /usr/share/kibana/node/bin/node
+
+#Enable and start the Kibana service:
+systemctl daemon-reload
+systemctl enable kibana
+systemctl start kibana
+
+#allow port for elasticsearch from firewall
+firewall-cmd --zone=public --permanent --add-port 443/tcp
+firewall-cmd --reload
+
+}
 
 main(){
     check_root
@@ -151,6 +247,9 @@ main(){
     enable_elasticsearch
     start_elasticsearch
     disable_elk_repos
+    install_kibana
+    configuring_kibana
+
 }
 
 main
